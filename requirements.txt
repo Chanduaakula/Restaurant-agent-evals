@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+langchain>=1.0
+langchain-google-genai
+pydantic
