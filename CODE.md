@@ -1,6 +1,8 @@
 # Restaurant Assistant Backend
 
-FastAPI backend. `POST /chat` returns three labeled parts: `google` (Gemini agent answer and tool calls), `jev` (Jev intent classification over the whole conversation) and `options` (clickable choices the frontend shows so the user doesn't have to type).
+FastAPI backend. `POST /chat` returns three labeled parts: `google` (Gemini agent answer and tool calls), `jev` (what Jev understood from the user's answer, plus the next question in Jev `Choice` format) and `state` (send it back with the next request).
+
+Guided flow: Q1 cuisine (tool 1) -> Q2 restaurant -> Q3 date -> Q4 party size -> availability check. If the user dislikes the options, or the table is fully booked, the flow restarts at Q1.
 
 Endpoints: `POST /chat` and `GET /health`. Run: `uvicorn main:app --reload`.
 
@@ -10,7 +12,6 @@ Environment variables (set in `.env` locally or in the host's settings; never co
 
 ```python
 
-import asyncio
 import logging
 import os
 
@@ -26,8 +27,8 @@ from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from tools import tools
-from jev_decision import safe_classify_restaurant_request
-from options import build_options
+import flow
+from jev_decision import safe_interpret_answer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -83,12 +84,13 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[Message] = Field(default_factory=list)
+    state: dict | None = None  # echo back the `state` from the last response
 
 
 class ChatResponse(BaseModel):
-    google: dict   # Gemini's answer: source, reply, tool_calls
-    jev: dict      # Jev's classification: source, intent, confidence, available
-    options: dict  # clickable choices: prompt + choices[{label, message}]
+    google: dict  # Gemini's answer: source, reply, tool_calls
+    jev: dict     # Jev: source, available, understood, next_question
+    state: dict   # send this back with the next request
 
 
 def _text(content) -> str:
@@ -112,21 +114,28 @@ async def invoke_gemini_agent(messages: list[dict]):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    messages = [m.model_dump() for m in req.history]
-    messages.append({"role": "user", "content": req.message})
+    history = [m.model_dump() for m in req.history]
+    state = req.state or dict(flow.START)
 
-    # Run both systems independently.
-    gemini_task = invoke_gemini_agent(messages)
-    jev_task = safe_classify_restaurant_request(
-        req.message,
-        [m.model_dump() for m in req.history],
-    )
+    # Jev reads the user's answer to the question it asked last turn.
+    asked = flow.question_for(state)
+    jev_result = await safe_interpret_answer(asked, req.message, history)
+    if jev_result["available"]:
+        method = "jev"
+        choice = jev_result["choice"]
+    else:
+        method = "fallback"
+        choice = flow.match_label(asked, req.message)
+
+    advance = flow.step(state, choice)
+
+    # Google answers the resolved step (or the user's own words if unresolved).
+    messages = history + [
+        {"role": "user", "content": advance["gemini_message"] or req.message}
+    ]
 
     try:
-        result, jev_result = await asyncio.gather(
-            gemini_task,
-            jev_task,
-        )
+        result = await invoke_gemini_agent(messages)
     except Exception:
         logger.exception("Gemini agent invocation failed")
         raise HTTPException(
@@ -155,10 +164,25 @@ async def chat(req: ChatRequest):
 
     reply = _text(out[-1].content) if out else ""
 
+    new_state = advance["state"]
+    next_question = flow.question_for(new_state)
+    if advance["notice"]:
+        next_question["text"] = f"{advance['notice']} {next_question['text']}"
+
     return ChatResponse(
         google={"source": "Google Gemini", "reply": reply, "tool_calls": tool_calls},
-        jev={"source": "Jev", **jev_result},
-        options=build_options(tool_calls),
+        jev={
+            "source": "Jev",
+            "available": jev_result["available"],
+            "understood": {
+                "question_id": asked["id"],
+                "choice": choice,
+                "confidence": jev_result["confidence"],
+                "method": method,
+            },
+            "next_question": next_question,
+        },
+        state=new_state,
     )
 
 
@@ -167,106 +191,252 @@ async def health():
     return {"status": "ok"}
 ```
 
-## options.py
+## flow.py
 
 ```python
-import json
+"""The guided booking conversation, asked as Jev-style Choice questions.
+
+Q1 cuisine (tool 1) -> Q2 restaurant -> Q3 date -> Q4 party size -> booking.
+If the user dislikes the options, or the table is fully booked, the flow
+restarts at Q1. The server is stateless: `state` travels with each request.
+"""
+
+from tools import check_reservation_availability, search_restaurants_by_cuisine
 
 CUISINES = ["Indian", "Italian", "Chinese", "Mexican"]
 
 # Dates that exist in the sample availability data in tools.py.
-BOOKING_DATES = [
+DATES = [
     ("15 Nov 2024", "2024-11-15"),
     ("16 Nov 2024", "2024-11-16"),
     ("17 Nov 2024", "2024-11-17"),
 ]
 
-# Shown last in every list so the user can always type their own message instead.
-TYPE_MY_OWN = {"label": "None of these - I'll type my own", "message": None}
+PARTY_SIZES = [2, 4, 6]
+
+START = {"asking": "cuisine"}
+
+RESTART_LABEL = "None of these - start over"
+RESTART_DESCRIPTION = (
+    "The user dislikes these options, wants something different, "
+    "or wants to start over"
+)
 
 
-def _choice(label: str, message: str) -> dict:
-    return {"label": label, "message": message}
+def _choice(key: str, label: str, description: str) -> dict:
+    # `message` is what the frontend sends when the user clicks the choice.
+    return {"key": key, "label": label, "description": description, "message": label}
 
 
-def _cuisine_options(prompt: str = "What cuisine would you like?") -> dict:
+def _question(qid: str, text: str, choices: list[dict], restartable: bool = True) -> dict:
+    if restartable:
+        choices = choices + [
+            _choice("restart", RESTART_LABEL, RESTART_DESCRIPTION)
+        ]
+    return {"id": qid, "type": "choice", "text": text, "choices": choices}
+
+
+def restaurants_for(cuisine: str) -> list[str]:
+    found = search_restaurants_by_cuisine.invoke({"cuisine_type": cuisine})
+    return [r["name"] for r in found]
+
+
+def question_for(state: dict) -> dict:
+    """The Jev-format question the user is being asked right now."""
+    asking = state.get("asking", "cuisine")
+
+    if asking == "restaurant":
+        cuisine = state["cuisine"]
+        return _question(
+            "restaurant",
+            f"Which {cuisine} restaurant would you like?",
+            [_choice(n, n, f"The restaurant {n}") for n in restaurants_for(cuisine)],
+        )
+
+    if asking == "date":
+        return _question(
+            "date",
+            f"When would you like to book {state['restaurant']}?",
+            [_choice(iso, label, f"The date {label}") for label, iso in DATES],
+        )
+
+    if asking == "party":
+        return _question(
+            "party",
+            "How many people?",
+            [_choice(str(n), f"{n} people", f"A party of {n}") for n in PARTY_SIZES],
+        )
+
+    return _question(
+        "cuisine",
+        "What cuisine would you like?",
+        [_choice(c.lower(), c, f"{c} cuisine") for c in CUISINES],
+        restartable=False,
+    )
+
+
+def match_label(question: dict, message: str) -> str | None:
+    """Fallback when Jev is unavailable: match the text against the choices."""
+    text = message.strip().lower()
+    for c in question["choices"]:
+        if text in (c["label"].lower(), c["key"].lower()):
+            return c["key"]
+    return None
+
+
+def step(state: dict, choice: str | None) -> dict:
+    """Advance the flow by one answer.
+
+    Returns {state, gemini_message, notice}. `gemini_message` is what Google
+    Gemini is asked this turn (None = pass through what the user typed);
+    `notice` is a line shown before the next question.
+    """
+    asking = state.get("asking", "cuisine")
+
+    if choice in (None, "other"):
+        # Free text: Gemini answers it, then the same question is asked again.
+        return {"state": state, "gemini_message": None, "notice": None}
+
+    if choice == "restart" and asking != "cuisine":
+        return {
+            "state": dict(START),
+            "gemini_message": (
+                "I don't like these options and want to start over. Reply with one "
+                "short friendly sentence only; do not call any tools."
+            ),
+            "notice": "Okay, let's start over.",
+        }
+
+    if asking == "cuisine":
+        cuisine = next((c for c in CUISINES if c.lower() == choice), None)
+        if cuisine is None:
+            return {"state": state, "gemini_message": None, "notice": None}
+        return {
+            "state": {"asking": "restaurant", "cuisine": cuisine},
+            "gemini_message": f"Show me {cuisine} restaurants",
+            "notice": None,
+        }
+
+    if asking == "restaurant":
+        return {
+            "state": {**state, "asking": "date", "restaurant": choice},
+            "gemini_message": f"Tell me about {choice}",
+            "notice": None,
+        }
+
+    if asking == "date":
+        return {
+            "state": {**state, "asking": "party", "date": choice},
+            "gemini_message": (
+                f"I'd like to book {state['restaurant']} on {choice}. Acknowledge "
+                "this in one short sentence; do not call any tools yet."
+            ),
+            "notice": None,
+        }
+
+    if asking == "party":
+        party = int(choice)
+        result = check_reservation_availability.invoke(
+            {
+                "restaurant_name": state["restaurant"],
+                "date": state["date"],
+                "party_size": party,
+            }
+        )
+        booked = "has availability" in result
+        return {
+            "state": dict(START),
+            "gemini_message": (
+                f"Check table availability at {state['restaurant']} "
+                f"on {state['date']} for {party} people. Report the result in one "
+                "or two sentences. If it is not available, say we will start over "
+                "from the beginning; do not suggest other dates."
+            ),
+            "notice": (
+                "Good news, that table is available! Want to look for another?"
+                if booked
+                else "Sorry, that table isn't available. Let's start over."
+            ),
+        }
+
+    return {"state": dict(START), "gemini_message": None, "notice": None}
+```
+
+## jev_decision.py
+
+```python
+import asyncio
+import logging
+import os
+
+from langsmith import traceable
+from typesafe_sdk import AsyncTypeSafeClient, Choice
+
+logger = logging.getLogger(__name__)
+
+
+def _jev_client() -> AsyncTypeSafeClient:
+    # Jev is also served through OpenRouter; use it when that key is set.
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if openrouter_key:
+        return AsyncTypeSafeClient(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api",
+            model=os.getenv("JEV_MODEL", "jev-latest"),
+        )
+    return AsyncTypeSafeClient()
+
+
+@traceable(name="Jev Interpret Answer")
+async def interpret_answer(
+    question: dict, user_answer: str, history: list[dict] | None = None
+) -> dict:
+    """Ask Jev which choice of `question` the user's answer selects."""
+    criteria = {c["key"]: c["description"] for c in question["choices"]}
+    criteria["other"] = (
+        "Anything else: a new question, or something that is not one of the choices"
+    )
+    conversation = "\n".join(
+        f"{m['role']}: {m['content']}" for m in (history or [])
+    )
+
+    async with _jev_client() as client:
+        response = await client.system_one(
+            state={
+                "conversation_so_far": conversation,
+                "question_asked": question["text"],
+                "user_answer": user_answer,
+            },
+            questions={
+                "answer": Choice(
+                    instructions=(
+                        "The assistant asked the user the question in state. "
+                        "Decide which choice the user's answer selects."
+                    ),
+                    criteria=criteria,
+                )
+            },
+        )
+
+    answer = response.answers["answer"]
     return {
-        "prompt": prompt,
-        "choices": [_choice(c, f"Show me {c} restaurants") for c in CUISINES]
-        + [TYPE_MY_OWN],
+        "choice": answer.choice,
+        "confidence": getattr(answer, "confidence", None),
+        "available": True,
     }
 
 
-def _parse(output: str):
+async def safe_interpret_answer(
+    question: dict, user_answer: str, history: list[dict] | None = None
+) -> dict:
     try:
-        return json.loads(output)
-    except (TypeError, ValueError):
-        return None
-
-
-def build_options(tool_calls: list[dict]) -> dict:
-    """Pick the next clickable choices from the last tool used this turn.
-
-    Each choice has a `label` to display and a `message` the frontend sends to
-    /chat when the user clicks it (`message: null` means let the user type).
-    """
-    if not tool_calls:
-        return _cuisine_options()
-
-    last = tool_calls[-1]
-    name = last["name"]
-    args = last.get("args") or {}
-    data = _parse(last["output"])
-
-    if name == "search_restaurants_by_cuisine":
-        # The model may search several cuisines in one turn; offer all of them.
-        found = []
-        for call in tool_calls:
-            if call["name"] != "search_restaurants_by_cuisine":
-                continue
-            results = _parse(call["output"])
-            if isinstance(results, list):
-                found += [r["name"] for r in results if isinstance(r, dict) and "name" in r]
-        if not found:
-            return _cuisine_options("I couldn't find that cuisine. Pick one:")
-        return {
-            "prompt": "Which restaurant would you like to know more about?",
-            "choices": [_choice(n, f"Tell me about {n}") for n in found]
-            + [_choice("Choose a different cuisine", "I want a different cuisine")]
-            + [TYPE_MY_OWN],
-        }
-
-    restaurant = args.get("restaurant_name")
-
-    if name == "get_restaurant_details":
-        if isinstance(data, dict) and "error" in data or not restaurant:
-            return _cuisine_options("I couldn't find that restaurant. Pick a cuisine:")
-        return {
-            "prompt": f"Book a table at {restaurant}? Pick a date (for 2 people):",
-            "choices": [
-                _choice(
-                    label,
-                    f"Check table availability at {restaurant} on {date} for 2 people",
-                )
-                for label, date in BOOKING_DATES
-            ]
-            + [
-                _choice("Choose a different cuisine", "I want a different cuisine"),
-                TYPE_MY_OWN,
-            ],
-        }
-
-    if name == "check_reservation_availability" and restaurant:
-        return {
-            "prompt": "Anything else?",
-            "choices": [
-                _choice(f"More about {restaurant}", f"Tell me about {restaurant}"),
-                _choice("Choose a different cuisine", "I want a different cuisine"),
-                TYPE_MY_OWN,
-            ],
-        }
-
-    return _cuisine_options()
+        return await asyncio.wait_for(
+            interpret_answer(question, user_answer, history),
+            timeout=10,
+        )
+    except Exception:
+        logger.exception("Jev interpretation failed")
+        return {"choice": None, "confidence": None, "available": False}
 ```
 
 ## tools.py
@@ -550,79 +720,6 @@ def check_reservation_availability(
 
 
 tools = [search_restaurants_by_cuisine, get_restaurant_details, check_reservation_availability]
-```
-
-## jev_decision.py
-
-```python
-import asyncio
-import logging
-import os
-
-from langsmith import traceable
-from typesafe_sdk import AsyncTypeSafeClient, Choice
-
-logger = logging.getLogger(__name__)
-
-
-def _jev_client() -> AsyncTypeSafeClient:
-    # Jev is also served through OpenRouter; use it when that key is set.
-    openrouter_key = os.getenv("OPENROUTER_API_KEY")
-    if openrouter_key:
-        return AsyncTypeSafeClient(
-            api_key=openrouter_key,
-            base_url="https://openrouter.ai/api",
-            model=os.getenv("JEV_MODEL", "jev-latest"),
-        )
-    return AsyncTypeSafeClient()
-
-
-@traceable(name="Jev Restaurant Classification")
-async def classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
-    conversation = "\n".join(
-        f"{m['role']}: {m['content']}" for m in (history or [])
-    )
-    async with _jev_client() as client:
-        response = await client.system_one(
-            state={"conversation_so_far": conversation, "user_request": message},
-            questions={
-                "intent": Choice(
-                    instructions=(
-                        "Classify what the user wants in their latest request, "
-                        "using the earlier conversation for context."
-                    ),
-                    criteria={
-                        "search": "Search for restaurants",
-                        "details": "Get restaurant details",
-                        "reservation": "Check reservation availability",
-                        "general": "Other questions",
-                    },
-                )
-            },
-        )
-
-    answer = response.answers["intent"]
-
-    return {
-        "intent": answer.choice,
-        "confidence": getattr(answer, "confidence", None),
-        "available": True,
-    }
-
-
-async def safe_classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
-    try:
-        return await asyncio.wait_for(
-            classify_restaurant_request(message, history),
-            timeout=10,
-        )
-    except Exception:
-        logger.exception("Jev classification failed")
-        return {
-            "intent": "unknown",
-            "confidence": None,
-            "available": False,
-        }
 ```
 
 ## requirements.txt

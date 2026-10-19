@@ -20,49 +20,53 @@ def _jev_client() -> AsyncTypeSafeClient:
     return AsyncTypeSafeClient()
 
 
-@traceable(name="Jev Restaurant Classification")
-async def classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
+@traceable(name="Jev Interpret Answer")
+async def interpret_answer(
+    question: dict, user_answer: str, history: list[dict] | None = None
+) -> dict:
+    """Ask Jev which choice of `question` the user's answer selects."""
+    criteria = {c["key"]: c["description"] for c in question["choices"]}
+    criteria["other"] = (
+        "Anything else: a new question, or something that is not one of the choices"
+    )
     conversation = "\n".join(
         f"{m['role']}: {m['content']}" for m in (history or [])
     )
+
     async with _jev_client() as client:
         response = await client.system_one(
-            state={"conversation_so_far": conversation, "user_request": message},
+            state={
+                "conversation_so_far": conversation,
+                "question_asked": question["text"],
+                "user_answer": user_answer,
+            },
             questions={
-                "intent": Choice(
+                "answer": Choice(
                     instructions=(
-                        "Classify what the user wants in their latest request, "
-                        "using the earlier conversation for context."
+                        "The assistant asked the user the question in state. "
+                        "Decide which choice the user's answer selects."
                     ),
-                    criteria={
-                        "search": "Search for restaurants",
-                        "details": "Get restaurant details",
-                        "reservation": "Check reservation availability",
-                        "general": "Other questions",
-                    },
+                    criteria=criteria,
                 )
             },
         )
 
-    answer = response.answers["intent"]
-
+    answer = response.answers["answer"]
     return {
-        "intent": answer.choice,
+        "choice": answer.choice,
         "confidence": getattr(answer, "confidence", None),
         "available": True,
     }
 
 
-async def safe_classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
+async def safe_interpret_answer(
+    question: dict, user_answer: str, history: list[dict] | None = None
+) -> dict:
     try:
         return await asyncio.wait_for(
-            classify_restaurant_request(message, history),
+            interpret_answer(question, user_answer, history),
             timeout=10,
         )
     except Exception:
-        logger.exception("Jev classification failed")
-        return {
-            "intent": "unknown",
-            "confidence": None,
-            "available": False,
-        }
+        logger.exception("Jev interpretation failed")
+        return {"choice": None, "confidence": None, "available": False}

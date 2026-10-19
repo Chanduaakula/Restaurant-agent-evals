@@ -1,5 +1,4 @@
 ﻿
-import asyncio
 import logging
 import os
 
@@ -15,8 +14,8 @@ from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from tools import tools
-from jev_decision import safe_classify_restaurant_request
-from options import build_options
+import flow
+from jev_decision import safe_interpret_answer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,12 +71,13 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     history: list[Message] = Field(default_factory=list)
+    state: dict | None = None  # echo back the `state` from the last response
 
 
 class ChatResponse(BaseModel):
-    google: dict   # Gemini's answer: source, reply, tool_calls
-    jev: dict      # Jev's classification: source, intent, confidence, available
-    options: dict  # clickable choices: prompt + choices[{label, message}]
+    google: dict  # Gemini's answer: source, reply, tool_calls
+    jev: dict     # Jev: source, available, understood, next_question
+    state: dict   # send this back with the next request
 
 
 def _text(content) -> str:
@@ -101,21 +101,28 @@ async def invoke_gemini_agent(messages: list[dict]):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    messages = [m.model_dump() for m in req.history]
-    messages.append({"role": "user", "content": req.message})
+    history = [m.model_dump() for m in req.history]
+    state = req.state or dict(flow.START)
 
-    # Run both systems independently.
-    gemini_task = invoke_gemini_agent(messages)
-    jev_task = safe_classify_restaurant_request(
-        req.message,
-        [m.model_dump() for m in req.history],
-    )
+    # Jev reads the user's answer to the question it asked last turn.
+    asked = flow.question_for(state)
+    jev_result = await safe_interpret_answer(asked, req.message, history)
+    if jev_result["available"]:
+        method = "jev"
+        choice = jev_result["choice"]
+    else:
+        method = "fallback"
+        choice = flow.match_label(asked, req.message)
+
+    advance = flow.step(state, choice)
+
+    # Google answers the resolved step (or the user's own words if unresolved).
+    messages = history + [
+        {"role": "user", "content": advance["gemini_message"] or req.message}
+    ]
 
     try:
-        result, jev_result = await asyncio.gather(
-            gemini_task,
-            jev_task,
-        )
+        result = await invoke_gemini_agent(messages)
     except Exception:
         logger.exception("Gemini agent invocation failed")
         raise HTTPException(
@@ -144,10 +151,25 @@ async def chat(req: ChatRequest):
 
     reply = _text(out[-1].content) if out else ""
 
+    new_state = advance["state"]
+    next_question = flow.question_for(new_state)
+    if advance["notice"]:
+        next_question["text"] = f"{advance['notice']} {next_question['text']}"
+
     return ChatResponse(
         google={"source": "Google Gemini", "reply": reply, "tool_calls": tool_calls},
-        jev={"source": "Jev", **jev_result},
-        options=build_options(tool_calls),
+        jev={
+            "source": "Jev",
+            "available": jev_result["available"],
+            "understood": {
+                "question_id": asked["id"],
+                "choice": choice,
+                "confidence": jev_result["confidence"],
+                "method": method,
+            },
+            "next_question": next_question,
+        },
+        state=new_state,
     )
 
 
