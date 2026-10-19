@@ -102,7 +102,10 @@ async def chat(req: ChatRequest):
 
     # Run both systems independently.
     gemini_task = invoke_gemini_agent(messages)
-    jev_task = safe_classify_restaurant_request(req.message)
+    jev_task = safe_classify_restaurant_request(
+        req.message,
+        [m.model_dump() for m in req.history],
+    )
 
     try:
         result, jev_result = await asyncio.gather(

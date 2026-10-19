@@ -1,6 +1,6 @@
 # Restaurant Assistant Backend
 
-FastAPI backend: a Gemini agent (LangChain) with restaurant tools, plus a Jev (TypeSafe) request classifier, traced with LangSmith.
+FastAPI backend: a Gemini agent (LangChain) with restaurant tools, plus a Jev (TypeSafe) request classifier that sees the whole conversation, traced with LangSmith.
 
 Endpoints: `POST /chat` and `GET /health`. Run: `uvicorn main:app --reload`.
 
@@ -113,7 +113,10 @@ async def chat(req: ChatRequest):
 
     # Run both systems independently.
     gemini_task = invoke_gemini_agent(messages)
-    jev_task = safe_classify_restaurant_request(req.message)
+    jev_task = safe_classify_restaurant_request(
+        req.message,
+        [m.model_dump() for m in req.history],
+    )
 
     try:
         result, jev_result = await asyncio.gather(
@@ -367,13 +370,19 @@ logger = logging.getLogger(__name__)
 
 
 @traceable(name="Jev Restaurant Classification")
-async def classify_restaurant_request(message: str) -> dict:
+async def classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
+    conversation = "\n".join(
+        f"{m['role']}: {m['content']}" for m in (history or [])
+    )
     async with AsyncTypeSafeClient() as client:
         response = await client.system_one(
-            state={"user_request": message},
+            state={"conversation_so_far": conversation, "user_request": message},
             questions={
                 "intent": Choice(
-                    instructions="Classify the restaurant request.",
+                    instructions=(
+                        "Classify what the user wants in their latest request, "
+                        "using the earlier conversation for context."
+                    ),
                     criteria={
                         "search": "Search for restaurants",
                         "details": "Get restaurant details",
@@ -393,10 +402,10 @@ async def classify_restaurant_request(message: str) -> dict:
     }
 
 
-async def safe_classify_restaurant_request(message: str) -> dict:
+async def safe_classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
     try:
         return await asyncio.wait_for(
-            classify_restaurant_request(message),
+            classify_restaurant_request(message, history),
             timeout=10,
         )
     except Exception:
