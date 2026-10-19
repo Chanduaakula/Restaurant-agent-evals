@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from tools import tools
 from jev_decision import safe_classify_restaurant_request
+from options import build_options
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,6 +33,9 @@ You have access to these tools:
 Use the appropriate tool whenever necessary.
 
 Do not invent restaurant information.
+
+For reservations, never guess the date or party size. If either is
+missing, ask the user for it before calling the availability tool.
 
 If the available tools cannot answer the question,
 clearly say that the requested information is outside
@@ -71,9 +75,9 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    reply: str
-    tool_calls: list[dict]
-    jev: dict
+    google: dict   # Gemini's answer: source, reply, tool_calls
+    jev: dict      # Jev's classification: source, intent, confidence, available
+    options: dict  # clickable choices: prompt + choices[{label, message}]
 
 
 def _text(content) -> str:
@@ -121,9 +125,17 @@ async def chat(req: ChatRequest):
 
     out = result["messages"]
 
+    # Arguments the model passed to each tool, keyed by tool-call id.
+    call_args = {
+        c["id"]: c.get("args", {})
+        for m in out
+        for c in (getattr(m, "tool_calls", None) or [])
+    }
+
     tool_calls = [
         {
             "name": m.name,
+            "args": call_args.get(getattr(m, "tool_call_id", None), {}),
             "output": _text(m.content),
         }
         for m in out
@@ -133,9 +145,9 @@ async def chat(req: ChatRequest):
     reply = _text(out[-1].content) if out else ""
 
     return ChatResponse(
-        reply=reply,
-        tool_calls=tool_calls,
-        jev=jev_result,
+        google={"source": "Google Gemini", "reply": reply, "tool_calls": tool_calls},
+        jev={"source": "Jev", **jev_result},
+        options=build_options(tool_calls),
     )
 
 

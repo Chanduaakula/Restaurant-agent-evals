@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 from langsmith import traceable
 from typesafe_sdk import AsyncTypeSafeClient, Choice
@@ -7,12 +8,24 @@ from typesafe_sdk import AsyncTypeSafeClient, Choice
 logger = logging.getLogger(__name__)
 
 
+def _jev_client() -> AsyncTypeSafeClient:
+    # Jev is also served through OpenRouter; use it when that key is set.
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    if openrouter_key:
+        return AsyncTypeSafeClient(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api",
+            model=os.getenv("JEV_MODEL", "jev-latest"),
+        )
+    return AsyncTypeSafeClient()
+
+
 @traceable(name="Jev Restaurant Classification")
 async def classify_restaurant_request(message: str, history: list[dict] | None = None) -> dict:
     conversation = "\n".join(
         f"{m['role']}: {m['content']}" for m in (history or [])
     )
-    async with AsyncTypeSafeClient() as client:
+    async with _jev_client() as client:
         response = await client.system_one(
             state={"conversation_so_far": conversation, "user_request": message},
             questions={

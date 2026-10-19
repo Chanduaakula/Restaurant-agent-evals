@@ -112,6 +112,51 @@ def get_restaurant_details(restaurant_name: str) -> dict:
             "phone": "9555666777",
             "hours": "11 AM - 11 PM",
             "speciality": "Szechuan Noodles, Dim Sum"
+        },
+
+        "Pasta Dreams": {
+            "cuisine": "Italian",
+            "rating": 4.6,
+            "address": "12 Olive Road, Riverside",
+            "phone": "9666777888",
+            "hours": "12 PM - 11 PM",
+            "speciality": "Truffle Pasta, Lasagna"
+        },
+
+        "Roma Kitchen": {
+            "cuisine": "Italian",
+            "rating": 4.2,
+            "address": "34 Piazza Lane, Old Town",
+            "phone": "9777888999",
+            "hours": "11:30 AM - 10:30 PM",
+            "speciality": "Risotto, Wood-fired Pizza"
+        },
+
+        "Ming's Kitchen": {
+            "cuisine": "Chinese",
+            "rating": 4.3,
+            "address": "56 Lantern Street, Chinatown",
+            "phone": "9888999000",
+            "hours": "12 PM - 11 PM",
+            "speciality": "Manchurian, Hot and Sour Soup"
+        },
+
+        "Salsa Nights": {
+            "cuisine": "Mexican",
+            "rating": 4.6,
+            "address": "78 Fiesta Avenue, Hip District",
+            "phone": "9999000111",
+            "hours": "2 PM - 12:30 AM",
+            "speciality": "Enchiladas, Churros"
+        },
+
+        "Burrito House": {
+            "cuisine": "Mexican",
+            "rating": 4.2,
+            "address": "90 Cantina Road, Market Area",
+            "phone": "9000111222",
+            "hours": "11 AM - 10 PM",
+            "speciality": "Loaded Burritos, Nachos"
         }
     }
 
@@ -171,6 +216,42 @@ def check_reservation_availability(
             "2024-11-15": False,
             "2024-11-16": True,
             "2024-11-17": True
+        },
+
+        "Golden Wok": {
+            "2024-11-15": True,
+            "2024-11-16": False,
+            "2024-11-17": True
+        },
+
+        "Pasta Dreams": {
+            "2024-11-15": True,
+            "2024-11-16": True,
+            "2024-11-17": False
+        },
+
+        "Roma Kitchen": {
+            "2024-11-15": False,
+            "2024-11-16": True,
+            "2024-11-17": True
+        },
+
+        "Ming's Kitchen": {
+            "2024-11-15": True,
+            "2024-11-16": True,
+            "2024-11-17": True
+        },
+
+        "Salsa Nights": {
+            "2024-11-15": False,
+            "2024-11-16": False,
+            "2024-11-17": True
+        },
+
+        "Burrito House": {
+            "2024-11-15": True,
+            "2024-11-16": True,
+            "2024-11-17": False
         }
     }
 
